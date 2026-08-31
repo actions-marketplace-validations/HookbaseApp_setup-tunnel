@@ -25685,7 +25685,9 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __importStar(__nccwpck_require__(7484));
 const exec = __importStar(__nccwpck_require__(5236));
 const child_process_1 = __nccwpck_require__(5317);
-const readline_1 = __nccwpck_require__(3785);
+const fs_1 = __nccwpck_require__(9896);
+const os_1 = __nccwpck_require__(857);
+const path_1 = __nccwpck_require__(6928);
 async function run() {
     try {
         const port = core.getInput('port', { required: true });
@@ -25713,25 +25715,29 @@ async function run() {
         const args = ['tunnels', 'start', port, '--json'];
         if (subdomain)
             args.push('--subdomain', subdomain);
-        core.info(`Starting tunnel on port ${port}...`);
+        // Redirect CLI stdio to a log file rather than piping back to this
+        // process. Once the action step exits, the CLI continues running with
+        // its file descriptors pointing at a real file — no kernel-pipe buffer
+        // can fill up and block its event loop, which would cause the WebSocket
+        // to stall and the tunnel to be torn down by Cloudflare.
+        const logPath = (0, path_1.join)((0, os_1.tmpdir)(), `hookbase-tunnel-${port}-${Date.now()}.log`);
+        core.saveState('tunnel-log', logPath);
+        const logFd = (0, fs_1.openSync)(logPath, 'a');
+        core.info(`Starting tunnel on port ${port} (log: ${logPath})...`);
         const child = (0, child_process_1.spawn)('hookbase', args, {
             env,
             detached: true,
-            stdio: ['ignore', 'pipe', 'pipe'],
+            stdio: ['ignore', logFd, logFd],
         });
         if (!child.pid) {
             throw new Error('Failed to spawn hookbase process.');
         }
         core.saveState('tunnel-pid', String(child.pid));
-        const tunnelUrl = await waitForConnection(child, readyTimeoutMs);
+        const tunnelUrl = await waitForConnection(child, logPath, readyTimeoutMs);
         core.setOutput('tunnel-url', tunnelUrl);
         core.exportVariable('HOOKBASE_TUNNEL_URL', tunnelUrl);
         core.info(`Tunnel ready: ${tunnelUrl}`);
-        detachFromChild(child);
-        // Hard exit — the detached CLI keeps running; cleanup.ts SIGTERMs it
-        // during the post step. Anything still holding our event loop open
-        // (libuv references on the spawned child, internal stream buffers,
-        // GITHUB_OUTPUT writes) would otherwise hang the action step.
+        child.unref();
         process.exit(0);
     }
     catch (err) {
@@ -25739,68 +25745,68 @@ async function run() {
         process.exit(1);
     }
 }
-function detachFromChild(child) {
-    // Without this, the parent's event loop stays alive forever because we're
-    // still piping stdout/stderr through readline / data listeners. We've got
-    // what we need from the child — let it run on its own until cleanup.ts
-    // SIGTERMs it during the post step.
-    child.removeAllListeners('exit');
-    child.removeAllListeners('error');
-    child.stdout?.removeAllListeners();
-    child.stderr?.removeAllListeners();
-    child.stdout?.destroy();
-    child.stderr?.destroy();
-    child.unref();
-}
-function waitForConnection(child, timeoutMs) {
+function waitForConnection(child, logPath, timeoutMs) {
     return new Promise((resolve, reject) => {
         let createdUrl = null;
+        let lastSize = 0;
         let settled = false;
         const settleResolve = (url) => {
             if (settled)
                 return;
             settled = true;
+            clearInterval(poll);
             clearTimeout(timer);
+            child.removeAllListeners('exit');
+            child.removeAllListeners('error');
             resolve(url);
         };
         const settleReject = (err) => {
             if (settled)
                 return;
             settled = true;
+            clearInterval(poll);
             clearTimeout(timer);
+            child.removeAllListeners('exit');
+            child.removeAllListeners('error');
             reject(err);
         };
         const timer = setTimeout(() => {
             settleReject(new Error(`Tunnel did not become ready within ${timeoutMs}ms. ` +
                 (createdUrl ? `Tunnel was created (${createdUrl}) but never connected.` : '')));
         }, timeoutMs);
-        if (!child.stdout) {
-            settleReject(new Error('hookbase process produced no stdout.'));
-            return;
-        }
-        const stdoutLines = (0, readline_1.createInterface)({ input: child.stdout });
-        stdoutLines.on('line', (line) => {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('{'))
+        const poll = setInterval(() => {
+            if (!(0, fs_1.existsSync)(logPath))
                 return;
+            let contents;
             try {
-                const parsed = JSON.parse(trimmed);
-                if (parsed.event === 'tunnel.created' && typeof parsed.tunnelUrl === 'string') {
-                    createdUrl = parsed.tunnelUrl;
-                }
-                if (parsed.event === 'tunnel.connected' && typeof parsed.tunnelUrl === 'string') {
-                    settleResolve(parsed.tunnelUrl);
-                }
+                contents = (0, fs_1.readFileSync)(logPath, 'utf8');
             }
             catch {
-                // ignore non-JSON lines
+                return;
             }
-        });
-        if (child.stderr) {
-            child.stderr.on('data', (chunk) => {
-                core.warning(`hookbase stderr: ${chunk.toString().trim()}`);
-            });
-        }
+            if (contents.length === lastSize)
+                return;
+            lastSize = contents.length;
+            const lines = contents.split('\n');
+            for (const raw of lines) {
+                const line = raw.trim();
+                if (!line.startsWith('{'))
+                    continue;
+                try {
+                    const parsed = JSON.parse(line);
+                    if (parsed.event === 'tunnel.created' && typeof parsed.tunnelUrl === 'string') {
+                        createdUrl = parsed.tunnelUrl;
+                    }
+                    if (parsed.event === 'tunnel.connected' && typeof parsed.tunnelUrl === 'string') {
+                        settleResolve(parsed.tunnelUrl);
+                        return;
+                    }
+                }
+                catch {
+                    // ignore non-JSON lines
+                }
+            }
+        }, 100);
         child.on('exit', (code, signal) => {
             settleReject(new Error(`hookbase exited unexpectedly (code=${code}, signal=${signal}) before tunnel was ready.`));
         });
@@ -25979,14 +25985,6 @@ module.exports = require("perf_hooks");
 
 "use strict";
 module.exports = require("querystring");
-
-/***/ }),
-
-/***/ 3785:
-/***/ ((module) => {
-
-"use strict";
-module.exports = require("readline");
 
 /***/ }),
 
